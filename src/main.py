@@ -1,7 +1,11 @@
+import html
 import json
 import os
+import queue
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 # Allow running as `python src/main.py` (or VS Code's Run button) as well as
@@ -36,13 +40,25 @@ def create_openai_client() -> OpenAI:
 def run_pipeline(
     episode_title: str = "The Future of AI: Catastrophe or Control?",
     pdf_files: list[str | Path] | None = None,
+    progress=None,
 ) -> Path:
-    """Run the complete podcast-generation pipeline."""
+    """Run the complete podcast-generation pipeline.
 
+    progress, if given, is called as progress(fraction, description) at each
+    stage so a UI can show how far along the episode is.
+    """
+
+    def report(fraction: float, description: str) -> None:
+        print(f"[{fraction:>4.0%}] {description}")
+        if progress is not None:
+            progress(fraction, desc=description)
+
+    report(0.02, "Connecting to OpenAI...")
     client = create_openai_client()
     if pdf_files is None:
         pdf_files = sorted(SOURCE_DIR.glob("*.pdf"))
 
+    report(0.05, "Reading source PDFs...")
     content = from_multiple_pdfs(pdf_files)
 
     source_text = content["text"]
@@ -56,6 +72,7 @@ def run_pipeline(
         for source in content["sources"]
     )
 
+    report(0.10, "Writing the podcast script (this can take a minute)...")
     podcast_script = generate_podcast_script(
         client=client,
         source_text=source_text,
@@ -88,12 +105,23 @@ def run_pipeline(
             encoding="utf-8",
         )
 
+        # Audio is the slowest step, so it gets 30%-90% of the bar.
+        report(0.30, "Recording voices...")
+
+        def on_segment(done: int, total: int) -> None:
+            report(
+                0.30 + 0.60 * done / total,
+                f"Recording voices: segment {done} of {total}",
+            )
+
         segment_paths = generate_script_segments(
             client=client,
             script=podcast_script,
             output_dir=temporary_folder / "segments",
+            on_progress=on_segment,
         )
 
+        report(0.93, "Mixing the final episode...")
         combine_audio_segments(
             segment_paths=segment_paths,
             output_path=temporary_audio_path,
@@ -189,7 +217,79 @@ def load_existing_episode():
     else:
         sources = from_multiple_pdfs(selected_pdf_paths(None))["sources"]
 
-    return transcript, str(audio_path), format_source_references(sources)
+    # A readable copy of the transcript for the download button.
+    transcript_path = OUTPUT_DIR / "episode_transcript.md"
+    transcript_path.write_text(transcript, encoding="utf-8")
+
+    return (
+        transcript,
+        str(audio_path),
+        format_source_references(sources),
+        str(transcript_path),
+    )
+
+
+# Generation stages shown in the status card, with the progress fraction at
+# which each one starts (matching the report() calls in run_pipeline).
+PIPELINE_STEPS = [
+    ("Read sources", 0.0),
+    ("Write script", 0.10),
+    ("Record voices", 0.30),
+    ("Mix episode", 0.93),
+]
+
+
+def render_status(
+    state: str,
+    message: str,
+    fraction: float = 0.0,
+    elapsed: float | None = None,
+) -> str:
+    """Build the HTML status card.
+
+    state is one of: idle, running, done, error.
+    """
+
+    message = html.escape(message)
+
+    if state != "running":
+        icon = {"idle": "○", "done": "✓", "error": "!"}[state]
+        return (
+            f'<div class="status-card status-{state}">'
+            f'<div class="status-line"><span class="status-icon">{icon}</span>'
+            f"<span>{message}</span></div></div>"
+        )
+
+    active = max(
+        index
+        for index, (_, start) in enumerate(PIPELINE_STEPS)
+        if fraction >= start
+    )
+    steps_html = "".join(
+        f'<li class="step step-'
+        f'{"done" if index < active else "active" if index == active else "todo"}">'
+        f'<span class="step-dot"></span>{name}</li>'
+        for index, (name, _) in enumerate(PIPELINE_STEPS)
+    )
+    elapsed_text = ""
+    if elapsed is not None:
+        minutes, seconds = divmod(int(elapsed), 60)
+        elapsed_text = f'<span class="status-time">{minutes}:{seconds:02d}</span>'
+
+    return f"""
+    <div class="status-card status-running">
+      <div class="status-line">
+        <span class="status-spinner"></span>
+        <span class="status-message">{message}</span>
+        <span class="status-percent">{fraction:.0%}</span>
+        {elapsed_text}
+      </div>
+      <div class="status-track">
+        <div class="status-fill" style="width: {fraction * 100:.1f}%"></div>
+      </div>
+      <ol class="status-steps">{steps_html}</ol>
+    </div>
+    """
 
 
 def launch_interface():
@@ -197,58 +297,121 @@ def launch_interface():
 
     import gradio as gr
 
-    def create_episode(pdf_files):
-        """Generate a fresh episode, then display the new saved files."""
+    def episode_outputs(status_html, button_label="Generate Podcast Episode"):
+        """Outputs for a finished (or failed) run: re-enable the button and
+        fill the player, transcript, sources and download buttons."""
 
-        # Yield once so the interface can show that processing has started.
-        yield (
-            "**Status:** Generating a new podcast episode...",
-            None,
-            "",
-            preview_sources(pdf_files),
+        transcript, audio_path, source_references, transcript_path = (
+            load_existing_episode()
         )
-
-        try:
-            # Always run the complete pipeline. This makes fresh API calls and
-            # reflects any changes to the source PDFs or prompt.
-            run_pipeline(pdf_files=selected_pdf_paths(pdf_files))
-            transcript, audio_path, source_references = load_existing_episode()
-        except (FileNotFoundError, ValueError) as error:
-            raise gr.Error(str(error)) from error
-        except Exception as error:
-            print(f"Episode generation failed: {error}")
-            raise gr.Error(
-                "Could not generate the episode. Check the VS Code terminal "
-                "for details."
-            ) from error
-
-        yield (
-            "**Status:** Episode ready to play.",
+        return (
+            status_html,
+            gr.Button(value=button_label, interactive=True),
             audio_path,
             transcript,
             source_references,
+            gr.DownloadButton(value=audio_path, visible=True),
+            gr.DownloadButton(value=transcript_path, visible=True),
+        )
+
+    def failed_outputs(message):
+        return (
+            render_status("error", message),
+            gr.Button(value="Try Again", interactive=True),
+            gr.skip(),
+            gr.skip(),
+            gr.skip(),
+            gr.skip(),
+            gr.skip(),
+        )
+
+    def create_episode(pdf_files):
+        """Generate a fresh episode, streaming progress into the status card."""
+
+        pdf_paths = selected_pdf_paths(pdf_files)
+        updates = queue.Queue()
+        result = {}
+
+        def report(fraction, desc=""):
+            updates.put((fraction, desc))
+
+        def worker():
+            # Always run the complete pipeline. This makes fresh API calls and
+            # reflects any changes to the source PDFs or prompt.
+            try:
+                run_pipeline(pdf_files=pdf_paths, progress=report)
+            except Exception as error:  # reported back to the UI below
+                result["error"] = error
+
+        started = time.monotonic()
+        fraction, message = 0.0, "Starting..."
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+
+        yield (
+            render_status("running", message, fraction, 0),
+            gr.Button(value="Generating...", interactive=False),
+            None,
+            "",
+            preview_sources(pdf_files),
+            gr.DownloadButton(visible=False),
+            gr.DownloadButton(visible=False),
+        )
+
+        # Refresh at least once a second so the elapsed timer keeps ticking,
+        # which also shows the app hasn't frozen during long API calls.
+        while thread.is_alive() or not updates.empty():
+            try:
+                fraction, message = updates.get(timeout=1)
+            except queue.Empty:
+                pass
+            yield (
+                render_status(
+                    "running", message, fraction, time.monotonic() - started
+                ),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+                gr.skip(),
+            )
+
+        if "error" in result:
+            error = result["error"]
+            print(f"Episode generation failed: {error!r}")
+            if isinstance(error, (FileNotFoundError, ValueError)):
+                yield failed_outputs(f"Generation failed: {error}")
+            else:
+                yield failed_outputs(
+                    "Could not generate the episode. Check the VS Code "
+                    "terminal for details."
+                )
+            return
+
+        minutes, seconds = divmod(int(time.monotonic() - started), 60)
+        yield episode_outputs(
+            render_status(
+                "done",
+                f"New episode ready to play (made in {minutes}:{seconds:02d}).",
+            )
         )
 
     def load_saved_episode():
         """Load the existing episode without making API calls."""
 
         try:
-            transcript, audio_path, source_references = load_existing_episode()
+            return episode_outputs(
+                render_status("done", "Saved episode loaded and ready to play.")
+            )
         except FileNotFoundError as error:
-            raise gr.Error(str(error)) from error
+            return failed_outputs(str(error))
         except Exception as error:
-            print(f"Saved episode could not be loaded: {error}")
-            raise gr.Error(
+            print(f"Saved episode could not be loaded: {error!r}")
+            return failed_outputs(
                 "Could not load the saved episode. Check the VS Code terminal "
                 "for details."
-            ) from error
-
-        return (
-            "**Status:** Episode ready to play.",
-            audio_path,
-            transcript,
-            source_references,
-        )
+            )
 
     source_references = """
     1. **Rogul, A. (2026).**
@@ -418,6 +581,124 @@ def launch_interface():
         fill: var(--studio-text) !important;
         stroke: var(--studio-text) !important;
     }
+    /* Audio player: playback-speed button (bottom-left corner), the
+       download / share icon buttons, and their wrapper. */
+    .gradio-container .playback,
+    .gradio-container .icon-button-wrapper,
+    .gradio-container .icon-button,
+    .gradio-container .icon-button-wrapper button,
+    .gradio-container .icon-button-wrapper a,
+    .gradio-container a.download-link,
+    .gradio-container .control-wrapper button,
+    .gradio-container .settings-wrapper button {
+        background: var(--studio-panel) !important;
+        color: var(--studio-text) !important;
+        border-color: var(--studio-border) !important;
+    }
+    .gradio-container .icon-button:hover,
+    .gradio-container .playback:hover,
+    .gradio-container a.download-link:hover {
+        background: var(--studio-panel-2) !important;
+    }
+    .gradio-container .icon-button svg,
+    .gradio-container a.download-link svg {
+        color: var(--studio-text) !important;
+    }
+    /* Status card: idle / running (progress bar + steps) / done / error. */
+    .status-card {
+        background: var(--studio-panel);
+        border: 1px solid var(--studio-border);
+        border-radius: 14px;
+        padding: 16px 20px;
+        color: var(--studio-text);
+    }
+    .status-done { border-color: #10b981; background: rgba(16, 185, 129, 0.08); }
+    .status-error { border-color: #f43f5e; background: rgba(244, 63, 94, 0.08); }
+    .status-line {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        font-size: 1rem;
+        font-weight: 600;
+    }
+    .status-icon {
+        display: inline-grid;
+        place-items: center;
+        width: 24px;
+        height: 24px;
+        flex: none;
+        border-radius: 50%;
+        font-size: 0.85rem;
+        background: var(--studio-panel-2);
+        color: var(--studio-muted);
+    }
+    .status-done .status-icon { background: #10b981; color: #fff; }
+    .status-error .status-icon { background: #f43f5e; color: #fff; }
+    .status-idle { color: var(--studio-muted); }
+    .status-message { flex: 1; }
+    .status-percent { font-variant-numeric: tabular-nums; color: #f472b6; }
+    .status-time {
+        font-variant-numeric: tabular-nums;
+        color: var(--studio-muted);
+        font-weight: 500;
+        min-width: 3.2em;
+        text-align: right;
+    }
+    .status-spinner {
+        width: 18px;
+        height: 18px;
+        flex: none;
+        border-radius: 50%;
+        border: 2.5px solid var(--studio-border);
+        border-top-color: #db2777;
+        animation: status-spin 0.8s linear infinite;
+    }
+    @keyframes status-spin { to { transform: rotate(360deg); } }
+    .status-track {
+        height: 8px;
+        margin: 14px 0 12px;
+        border-radius: 999px;
+        background: var(--studio-panel-2);
+        overflow: hidden;
+    }
+    .status-fill {
+        height: 100%;
+        border-radius: 999px;
+        background: linear-gradient(90deg, #7c3aed, #db2777);
+        transition: width 0.6s ease;
+    }
+    .status-steps {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px 22px;
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        font-size: 0.85rem;
+    }
+    .step { display: flex; align-items: center; gap: 8px; }
+    .step-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--studio-border);
+    }
+    .step-todo { color: var(--studio-muted); opacity: 0.6; }
+    .step-done { color: var(--studio-muted); }
+    .step-done .step-dot { background: #10b981; }
+    .step-active { color: var(--studio-text); font-weight: 700; }
+    .step-active .step-dot {
+        background: #db2777;
+        box-shadow: 0 0 0 4px rgba(219, 39, 119, 0.25);
+    }
+    /* Download buttons under the audio player. */
+    .download-row { padding: 12px; gap: 12px; }
+    .download-button { font-weight: 700 !important; }
+    .download-button.primary {
+        background: linear-gradient(90deg, #7c3aed, #db2777) !important;
+        color: white !important;
+        border: 0 !important;
+    }
     .play-button {
         font-size: 18px !important;
         font-weight: 700 !important;
@@ -428,7 +709,7 @@ def launch_interface():
     """
 
     with gr.Blocks(
-        title="AI Apocalypse? The Podcast",
+        title="🎙️ AI Apocalypse? The Podcast Studio",
         css=css,
         theme=gr.themes.Base(
             primary_hue="pink",
@@ -461,13 +742,22 @@ def launch_interface():
             body_text_color_dark="#f5f7fb",
             body_text_color_subdued="#b9c2d2",
             body_text_color_subdued_dark="#b9c2d2",
+            # Secondary/icon buttons (e.g. audio download) default to white.
+            button_secondary_background_fill="#202736",
+            button_secondary_background_fill_dark="#202736",
+            button_secondary_background_fill_hover="#171d2a",
+            button_secondary_background_fill_hover_dark="#171d2a",
+            button_secondary_text_color="#f5f7fb",
+            button_secondary_text_color_dark="#f5f7fb",
+            button_secondary_border_color="#354056",
+            button_secondary_border_color_dark="#354056",
         ),
     ) as demo:
         with gr.Column(elem_classes="app-container"):
             gr.Markdown(
                 """
                 <div class="hero">
-                <h1>AI Apocalypse? The Podcast</h1>
+                <h1>🎙️ AI Apocalypse? The Podcast Studio</h1>
                 <p>Listen to a conversational podcast created from the project's source papers.</p>
                 </div>
                 """
@@ -492,14 +782,34 @@ def launch_interface():
                     variant="secondary",
                 )
 
-            status_output = gr.Markdown("**Status:** No episode loaded.")
+            status_output = gr.HTML(
+                render_status(
+                    "idle",
+                    "No episode loaded yet. Generate a new one or load the "
+                    "saved episode.",
+                )
+            )
 
             with gr.Group(elem_classes="panel"):
                 gr.Markdown("## Podcast Audio", elem_classes="section-heading")
                 audio_output = gr.Audio(
                     show_label=False,
                     type="filepath",
+                    buttons=[],
                 )
+                with gr.Row(elem_classes="download-row"):
+                    download_audio_button = gr.DownloadButton(
+                        "⬇  Download Episode (MP3)",
+                        visible=False,
+                        variant="primary",
+                        elem_classes="download-button",
+                    )
+                    download_transcript_button = gr.DownloadButton(
+                        "⬇  Download Transcript",
+                        visible=False,
+                        variant="secondary",
+                        elem_classes="download-button",
+                    )
 
             with gr.Accordion(
                 "Podcast Transcript",
@@ -524,26 +834,30 @@ def launch_interface():
                 outputs=[source_references_output],
             )
 
+            episode_outputs_list = [
+                status_output,
+                generate_button,
+                audio_output,
+                transcript_output,
+                source_references_output,
+                download_audio_button,
+                download_transcript_button,
+            ]
+
+            # show_progress="hidden" turns off Gradio's default overlay on
+            # every output; the status card shows progress instead.
             generate_button.click(
                 fn=create_episode,
                 inputs=[pdf_upload],
-                outputs=[
-                    status_output,
-                    audio_output,
-                    transcript_output,
-                    source_references_output,
-                ],
+                outputs=episode_outputs_list,
+                show_progress="hidden",
             )
 
             load_button.click(
                 fn=load_saved_episode,
                 inputs=[],
-                outputs=[
-                    status_output,
-                    audio_output,
-                    transcript_output,
-                    source_references_output,
-                ],
+                outputs=episode_outputs_list,
+                show_progress="hidden",
             )
 
     return demo
@@ -551,4 +865,4 @@ def launch_interface():
 
 if __name__ == "__main__":
     app = launch_interface()
-    app.launch(share=True)
+    app.launch(share=True, allowed_paths=[str(OUTPUT_DIR)])

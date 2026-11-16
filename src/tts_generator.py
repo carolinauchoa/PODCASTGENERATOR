@@ -79,9 +79,13 @@ def generate_script_segments(
     client: OpenAI,
     script: dict,
     output_dir: str | Path = "outputs/segments",
+    on_progress=None,
 ) -> list[Path]:
     """
     Generate one MP3 file for each podcast segment.
+
+    on_progress, if given, is called as on_progress(done, total) after each
+    script segment is voiced.
     """
 
     if "segments" not in script:
@@ -117,7 +121,9 @@ def generate_script_segments(
 
             segment_paths.append(output_path)
 
-       
+        if on_progress is not None:
+            on_progress(index, len(script["segments"]))
+
     return segment_paths
 
 ##This function: reads the Ana and Rui MP3 files in order; joins them together;creates one final MP3; preserve the conversation sequence.
