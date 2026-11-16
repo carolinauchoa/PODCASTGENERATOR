@@ -1,0 +1,6 @@
+# Project dependencies will be added here.
+gradio
+pypdf
+pydub
+openai
+python-dotenv
